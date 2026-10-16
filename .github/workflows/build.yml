@@ -493,7 +493,7 @@ jobs:
           }
           EOF
 
-      -       - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
 
