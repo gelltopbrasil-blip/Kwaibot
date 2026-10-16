@@ -125,6 +125,7 @@ jobs:
               android:accessibilityEventTypes="typeWindowStateChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
               android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
               android:notificationTimeout="100"
               android:description="@string/service_desc" />
           EOF
@@ -141,10 +142,19 @@ jobs:
 
           import android.accessibilityservice.AccessibilityService
           import android.accessibilityservice.GestureDescription
+          import android.graphics.Color
           import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
           import android.os.Handler
           import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.WindowManager
           import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
           import kotlin.random.Random
 
           class AutoScrollService : AccessibilityService() {
@@ -159,8 +169,12 @@ jobs:
                   const val SWIPE_START_Y = 0.75f // início do swipe (% da altura)
                   const val SWIPE_END_Y = 0.25f   // fim do swipe (% da altura)
 
-                  // Pacotes do Kwai (confira o seu com "adb shell pm list packages | grep kwai")
-                  val targetPackages = setOf("com.kwai.bulldog", "com.kwai.video")
+                  // Pacotes do Kwai
+                  val targetPackages = setOf(
+                      "com.kwai.bulldog", "com.kwai.video", "com.kuaishou.nebula", "com.smile.gifmaker"
+                  )
+                  // true = só rola quando o Kwai está na tela; false = rola em qualquer app (para testar)
+                  const val ONLY_KWAI = true
                   // -------------------------------------
 
                   var running = false
@@ -170,13 +184,19 @@ jobs:
               private val handler = Handler(Looper.getMainLooper())
               private var currentPackage = ""
 
+              private var overlay: LinearLayout? = null
+              private var btnStart: Button? = null
+              private var btnStop: Button? = null
+
               private val loop = object : Runnable {
                   override fun run() {
                       if (!running) return
-                      if (currentPackage in targetPackages) swipeUp()
+                      if (isKwaiOnScreen()) swipeUp()
                       handler.postDelayed(this, nextDelay())
                   }
               }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
               private fun nextDelay(): Long {
                   val lo = minSeconds.coerceAtLeast(1)
@@ -188,11 +208,139 @@ jobs:
                   running = true
                   handler.removeCallbacks(loop)
                   handler.postDelayed(loop, nextDelay())
+                  updateOverlayState()
               }
 
               fun stop() {
                   running = false
                   handler.removeCallbacks(loop)
+                  updateOverlayState()
+              }
+
+              // ---------- Botões flutuantes ----------
+
+              fun showOverlay() {
+                  if (overlay != null) return
+                  val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(6), dp(6), dp(8), dp(6))
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#CC202020"))
+                          cornerRadius = dp(24).toFloat()
+                      }
+                  }
+
+                  val params = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = dp(8)
+                      y = resources.displayMetrics.heightPixels / 3
+                  }
+
+                  fun makeButton(label: String, color: Int, onClick: () -> Unit): Button =
+                      Button(this).apply {
+                          text = label
+                          textSize = 12f
+                          setTextColor(Color.WHITE)
+                          isAllCaps = true
+                          minWidth = 0
+                          minimumWidth = 0
+                          minHeight = 0
+                          minimumHeight = 0
+                          setPadding(dp(12), 0, dp(12), 0)
+                          background = GradientDrawable().apply {
+                              setColor(color)
+                              cornerRadius = dp(18).toFloat()
+                          }
+                          layoutParams = LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.WRAP_CONTENT, dp(36)
+                          ).apply { marginStart = dp(6) }
+                          setOnClickListener { onClick() }
+                      }
+
+                  // Alça para arrastar os botões
+                  val handle = TextView(this).apply {
+                      text = "✥"
+                      textSize = 20f
+                      setTextColor(Color.WHITE)
+                      setPadding(dp(8), 0, dp(8), 0)
+                  }
+                  var startX = 0
+                  var startY = 0
+                  var touchX = 0f
+                  var touchY = 0f
+                  handle.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              startX = params.x
+                              startY = params.y
+                              touchX = e.rawX
+                              touchY = e.rawY
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              params.x = startX + (e.rawX - touchX).toInt()
+                              params.y = startY + (e.rawY - touchY).toInt()
+                              try { wm.updateViewLayout(box, params) } catch (_: Exception) {}
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+
+                  val bStart = makeButton("START", Color.parseColor("#2E7D32")) { start() }
+                  val bStop = makeButton("STOP", Color.parseColor("#C62828")) { stop() }
+                  val bHide = makeButton("✕", Color.parseColor("#616161")) {
+                      stop()
+                      hideOverlay()
+                  }
+
+                  box.addView(handle)
+                  box.addView(bStart)
+                  box.addView(bStop)
+                  box.addView(bHide)
+
+                  try {
+                      wm.addView(box, params)
+                      overlay = box
+                      btnStart = bStart
+                      btnStop = bStop
+                      updateOverlayState()
+                  } catch (_: Exception) {
+                  }
+              }
+
+              fun hideOverlay() {
+                  val view = overlay ?: return
+                  try {
+                      (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(view)
+                  } catch (_: Exception) {
+                  }
+                  overlay = null
+                  btnStart = null
+                  btnStop = null
+              }
+
+              private fun updateOverlayState() {
+                  btnStart?.alpha = if (running) 0.35f else 1f
+                  btnStop?.alpha = if (running) 1f else 0.35f
+              }
+
+              // ---------- Rolagem ----------
+
+              private fun isKwaiOnScreen(): Boolean {
+                  if (!ONLY_KWAI) return true
+                  val pkg = rootInActiveWindow?.packageName?.toString() ?: currentPackage
+                  return pkg in targetPackages || pkg.contains("kwai", ignoreCase = true)
               }
 
               private fun swipeUp() {
@@ -210,7 +358,8 @@ jobs:
 
               override fun onAccessibilityEvent(event: AccessibilityEvent?) {
                   if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-                      currentPackage = event.packageName?.toString() ?: ""
+                      val pkg = event.packageName?.toString() ?: ""
+                      if (pkg != packageName) currentPackage = pkg
                   }
               }
 
@@ -223,6 +372,7 @@ jobs:
 
               override fun onDestroy() {
                   stop()
+                  hideOverlay()
                   instance = null
                   super.onDestroy()
               }
@@ -241,6 +391,7 @@ jobs:
           import android.widget.Button
           import android.widget.EditText
           import android.widget.LinearLayout
+          import android.widget.ScrollView
           import android.widget.TextView
           import android.widget.Toast
 
@@ -271,25 +422,49 @@ jobs:
                   val minField = numberField(AutoScrollService.minSeconds)
                   val maxField = numberField(AutoScrollService.maxSeconds)
 
+                  fun applyTimes() {
+                      AutoScrollService.minSeconds = minField.text.toString().toIntOrNull() ?: 10
+                      AutoScrollService.maxSeconds = maxField.text.toString().toIntOrNull() ?: 20
+                  }
+
+                  fun needService(): AutoScrollService? {
+                      val s = AutoScrollService.instance
+                      if (s == null) {
+                          Toast.makeText(this, "Ative o serviço de acessibilidade primeiro", Toast.LENGTH_LONG).show()
+                      }
+                      return s
+                  }
+
                   root.addView(label("1) Ative o serviço de acessibilidade do app"))
                   root.addView(button("Abrir acessibilidade") {
                       startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                   })
+
                   root.addView(label("\n2) Tempo por vídeo (segundos)"))
                   root.addView(label("Mínimo"))
                   root.addView(minField)
                   root.addView(label("Máximo"))
                   root.addView(maxField)
 
-                  root.addView(label("\n3) Iniciar e abrir o Kwai"))
+                  root.addView(label("\n3) Botões flutuantes (START / STOP sobre o Kwai)"))
+                  root.addView(button("Mostrar botões flutuantes") {
+                      val s = needService()
+                      if (s != null) {
+                          applyTimes()
+                          s.showOverlay()
+                          Toast.makeText(this, "Abra o Kwai e use START / STOP", Toast.LENGTH_SHORT).show()
+                      }
+                  })
+                  root.addView(button("Ocultar botões flutuantes") {
+                      AutoScrollService.instance?.hideOverlay()
+                  })
+
+                  root.addView(label("\n4) Controle pelo app"))
                   root.addView(button("Iniciar") {
-                      val service = AutoScrollService.instance
-                      if (service == null) {
-                          Toast.makeText(this, "Ative o serviço de acessibilidade primeiro", Toast.LENGTH_LONG).show()
-                      } else {
-                          AutoScrollService.minSeconds = minField.text.toString().toIntOrNull() ?: 10
-                          AutoScrollService.maxSeconds = maxField.text.toString().toIntOrNull() ?: 20
-                          service.start()
+                      val s = needService()
+                      if (s != null) {
+                          applyTimes()
+                          s.start()
                           Toast.makeText(this, "Iniciado. Abra o Kwai.", Toast.LENGTH_SHORT).show()
                       }
                   })
@@ -298,21 +473,26 @@ jobs:
                       Toast.makeText(this, "Parado", Toast.LENGTH_SHORT).show()
                   })
 
-                  setContentView(root)
+                  root.addView(label("\n5) Encerrar"))
+                  root.addView(button("Fechar tudo") {
+                      AutoScrollService.instance?.let {
+                          it.stop()
+                          it.hideOverlay()
+                          it.disableSelf() // desliga o serviço de acessibilidade
+                      }
+                      Toast.makeText(
+                          this,
+                          "Tudo fechado. Para usar de novo, ative a acessibilidade.",
+                          Toast.LENGTH_LONG
+                      ).show()
+                      finishAffinity()
+                  })
+
+                  setContentView(ScrollView(this).apply { addView(root) })
               }
           }
           EOF
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.7
-
-      - name: Compilar APK
-        working-directory: project
-        run: gradle assembleDebug --no-daemon
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: kwai-auto-scroll-apk
-          path: project/app/build/outputs/apk/debug/app-debug.apk
-          
+          g
