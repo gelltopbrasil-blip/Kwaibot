@@ -155,7 +155,19 @@ jobs:
           import android.widget.Button
           import android.widget.LinearLayout
           import android.widget.TextView
+          import android.widget.Toast
           import kotlin.random.Random
+
+          // Perfil de gestos: posições em % da tela, definidas por você
+          class Profile(
+              var x: Int,          // posição X do swipe (% da largura)
+              var startY: Int,     // início do swipe (% da altura)
+              var endY: Int,       // fim do swipe (% da altura)
+              var durationMs: Long,
+              var likeX: Int,      // posição X do toque de curtir (%)
+              var likeY: Int,      // posição Y do toque de curtir (%)
+              var actionDelayMs: Long // tempo entre curtir e rolar (ms)
+          )
 
           class AutoScrollService : AccessibilityService() {
 
@@ -175,6 +187,21 @@ jobs:
                   )
                   // true = só rola quando o Kwai está na tela; false = rola em qualquer app (para testar)
                   const val ONLY_KWAI = true
+
+                  // Ações extras (0 = desligado)
+                  var likeEveryN = 0   // curtir (toque duplo) a cada N vídeos
+                  var backEveryN = 0   // voltar 1 vídeo a cada N vídeos
+
+                  // Parada automática (0 = desligado)
+                  var stopAfterMinutes = 0  // para sozinho depois de N minutos
+                  var stopAfterVideos = 0   // para sozinho depois de N vídeos
+
+                  // Dois perfis de gestos (A e B). O perfil ativo é escolhido por você.
+                  val profiles = arrayOf(
+                      Profile(50, 75, 25, 300L, 50, 50, 800L),
+                      Profile(50, 80, 30, 400L, 50, 50, 800L)
+                  )
+                  var activeProfile = 0
                   // -------------------------------------
 
                   var running = false
@@ -183,15 +210,24 @@ jobs:
 
               private val handler = Handler(Looper.getMainLooper())
               private var currentPackage = ""
+              private var videoCount = 0
 
               private var overlay: LinearLayout? = null
               private var btnStart: Button? = null
               private var btnStop: Button? = null
+              private var btnProfile: Button? = null
+
+              private val autoStopRunnable = Runnable { autoStop("Tempo encerrado. Parado.") }
+
+              private fun autoStop(msg: String) {
+                  stop()
+                  Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+              }
 
               private val loop = object : Runnable {
                   override fun run() {
                       if (!running) return
-                      if (isKwaiOnScreen()) swipeUp()
+                      if (isKwaiOnScreen()) nextAction()
                       handler.postDelayed(this, nextDelay())
                   }
               }
@@ -206,6 +242,11 @@ jobs:
 
               fun start() {
                   running = true
+                  videoCount = 0
+                  handler.removeCallbacks(autoStopRunnable)
+                  if (stopAfterMinutes > 0) {
+                      handler.postDelayed(autoStopRunnable, stopAfterMinutes * 60_000L)
+                  }
                   handler.removeCallbacks(loop)
                   handler.postDelayed(loop, nextDelay())
                   updateOverlayState()
@@ -213,6 +254,7 @@ jobs:
 
               fun stop() {
                   running = false
+                  handler.removeCallbacks(autoStopRunnable)
                   handler.removeCallbacks(loop)
                   updateOverlayState()
               }
@@ -299,6 +341,11 @@ jobs:
 
                   val bStart = makeButton("START", Color.parseColor("#2E7D32")) { start() }
                   val bStop = makeButton("STOP", Color.parseColor("#C62828")) { stop() }
+                  val bLike = makeButton("♥", Color.parseColor("#AD1457")) { likeNow() }
+                  val bBack = makeButton("↩", Color.parseColor("#1565C0")) { swipeDown() }
+                  val bProfile = makeButton("A", Color.parseColor("#6A1B9A")) {
+                      setProfile(1 - activeProfile)
+                  }
                   val bHide = makeButton("✕", Color.parseColor("#616161")) {
                       stop()
                       hideOverlay()
@@ -307,6 +354,9 @@ jobs:
                   box.addView(handle)
                   box.addView(bStart)
                   box.addView(bStop)
+                  box.addView(bLike)
+                  box.addView(bBack)
+                  box.addView(bProfile)
                   box.addView(bHide)
 
                   try {
@@ -314,6 +364,7 @@ jobs:
                       overlay = box
                       btnStart = bStart
                       btnStop = bStop
+                      btnProfile = bProfile
                       updateOverlayState()
                   } catch (_: Exception) {
                   }
@@ -328,11 +379,18 @@ jobs:
                   overlay = null
                   btnStart = null
                   btnStop = null
+                  btnProfile = null
               }
 
               private fun updateOverlayState() {
                   btnStart?.alpha = if (running) 0.35f else 1f
                   btnStop?.alpha = if (running) 1f else 0.35f
+                  btnProfile?.text = if (activeProfile == 0) "A" else "B"
+              }
+
+              fun setProfile(index: Int) {
+                  activeProfile = index.coerceIn(0, profiles.size - 1)
+                  updateOverlayState()
               }
 
               // ---------- Rolagem ----------
@@ -343,18 +401,65 @@ jobs:
                   return pkg in targetPackages || pkg.contains("kwai", ignoreCase = true)
               }
 
-              private fun swipeUp() {
-                  val m = resources.displayMetrics
-                  val x = m.widthPixels / 2f
-                  val path = Path().apply {
-                      moveTo(x, m.heightPixels * SWIPE_START_Y)
-                      lineTo(x, m.heightPixels * SWIPE_END_Y)
+              private fun nextAction() {
+                  videoCount++
+                  if (stopAfterVideos > 0 && videoCount > stopAfterVideos) {
+                      autoStop("Limite de vídeos atingido. Parado.")
+                      return
                   }
+                  if (likeEveryN > 0 && videoCount % likeEveryN == 0) {
+                      likeNow()
+                      handler.postDelayed({ swipeUp() }, profiles[activeProfile].actionDelayMs)
+                  } else if (backEveryN > 0 && videoCount % backEveryN == 0) {
+                      swipeDown()
+                  } else {
+                      swipeUp()
+                  }
+              }
+
+              private fun px(percent: Int, total: Int): Float =
+                  total * (percent.coerceIn(0, 100) / 100f)
+
+              // Curtir = toque duplo na posição do perfil ativo
+              fun likeNow() {
+                  val m = resources.displayMetrics
+                  val p = profiles[activeProfile]
+                  val x = px(p.likeX, m.widthPixels)
+                  val y = px(p.likeY, m.heightPixels)
+                  val tap1 = Path().apply { moveTo(x, y) }
+                  val tap2 = Path().apply { moveTo(x, y) }
                   val gesture = GestureDescription.Builder()
-                      .addStroke(GestureDescription.StrokeDescription(path, 0, SWIPE_DURATION_MS))
+                      .addStroke(GestureDescription.StrokeDescription(tap1, 0, 50))
+                      .addStroke(GestureDescription.StrokeDescription(tap2, 150, 50))
                       .build()
                   dispatchGesture(gesture, null, null)
               }
+
+              private fun swipe(up: Boolean) {
+                  val m = resources.displayMetrics
+                  val p = profiles[activeProfile]
+                  val x = px(p.x, m.widthPixels)
+                  val y1 = px(p.startY, m.heightPixels)
+                  val y2 = px(p.endY, m.heightPixels)
+                  val path = Path().apply {
+                      if (up) {
+                          moveTo(x, y1)
+                          lineTo(x, y2)
+                      } else {
+                          moveTo(x, y2)
+                          lineTo(x, y1)
+                      }
+                  }
+                  val gesture = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, p.durationMs))
+                      .build()
+                  dispatchGesture(gesture, null, null)
+              }
+
+              // Voltar = swipe para baixo (vídeo anterior)
+              fun swipeDown() = swipe(false)
+
+              private fun swipeUp() = swipe(true)
 
               override fun onAccessibilityEvent(event: AccessibilityEvent?) {
                   if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
@@ -385,7 +490,7 @@ jobs:
           import android.app.Activity
           import android.content.Intent
           import android.os.Bundle
-          import android.provider.Settings
+                    import android.provider.Settings
           import android.text.InputType
           import android.view.ViewGroup
           import android.widget.Button
@@ -421,10 +526,18 @@ jobs:
 
                   val minField = numberField(AutoScrollService.minSeconds)
                   val maxField = numberField(AutoScrollService.maxSeconds)
+                  val likeField = numberField(AutoScrollService.likeEveryN)
+                  val backField = numberField(AutoScrollService.backEveryN)
+                  val stopMinField = numberField(AutoScrollService.stopAfterMinutes)
+                  val stopVideosField = numberField(AutoScrollService.stopAfterVideos)
 
                   fun applyTimes() {
                       AutoScrollService.minSeconds = minField.text.toString().toIntOrNull() ?: 10
                       AutoScrollService.maxSeconds = maxField.text.toString().toIntOrNull() ?: 20
+                      AutoScrollService.likeEveryN = likeField.text.toString().toIntOrNull() ?: 0
+                      AutoScrollService.backEveryN = backField.text.toString().toIntOrNull() ?: 0
+                      AutoScrollService.stopAfterMinutes = stopMinField.text.toString().toIntOrNull() ?: 0
+                      AutoScrollService.stopAfterVideos = stopVideosField.text.toString().toIntOrNull() ?: 0
                   }
 
                   fun needService(): AutoScrollService? {
@@ -445,12 +558,82 @@ jobs:
                   root.addView(minField)
                   root.addView(label("Máximo"))
                   root.addView(maxField)
+                  root.addView(label("Curtir a cada N vídeos (0 = nunca)"))
+                  root.addView(likeField)
+                  root.addView(label("Voltar 1 vídeo a cada N vídeos (0 = nunca)"))
+                  root.addView(backField)
+                  root.addView(label("Parar sozinho após N minutos (0 = não parar)"))
+                  root.addView(stopMinField)
+                  root.addView(label("Parar sozinho após N vídeos (0 = não parar)"))
+                  root.addView(stopVideosField)
+
+                  fun profileBlock(title: String, p: Profile): List<EditText> {
+                      root.addView(label("\n" + title))
+                      val items = listOf(
+                          "Swipe: posição X (% da largura)" to p.x,
+                          "Swipe: início Y (% da altura)" to p.startY,
+                          "Swipe: fim Y (% da altura)" to p.endY,
+                          "Swipe: duração (ms)" to p.durationMs.toInt(),
+                          "Curtir: posição X (%)" to p.likeX,
+                          "Curtir: posição Y (%)" to p.likeY,
+                          "Tempo entre curtir e rolar (ms)" to p.actionDelayMs.toInt()
+                      )
+                      return items.map { (name, v) ->
+                          root.addView(label(name))
+                          val field = numberField(v)
+                          root.addView(field)
+                          field
+                      }
+                  }
+
+                  val fieldsA = profileBlock("Perfil A", AutoScrollService.profiles[0])
+                  val fieldsB = profileBlock("Perfil B", AutoScrollService.profiles[1])
+
+                  fun readProfile(p: Profile, f: List<EditText>) {
+                      fun v(i: Int, d: Int) = f[i].text.toString().toIntOrNull() ?: d
+                      p.x = v(0, 50)
+                      p.startY = v(1, 75)
+                      p.endY = v(2, 25)
+                      p.durationMs = v(3, 300).toLong().coerceIn(50L, 2000L)
+                      p.likeX = v(4, 50)
+                      p.likeY = v(5, 50)
+                      p.actionDelayMs = v(6, 800).toLong().coerceIn(200L, 10000L)
+                  }
+
+                  fun applyAll() {
+                      applyTimes()
+                      readProfile(AutoScrollService.profiles[0], fieldsA)
+                      readProfile(AutoScrollService.profiles[1], fieldsB)
+                  }
+
+                  fun choose(i: Int) {
+                      applyAll()
+                      AutoScrollService.activeProfile = i
+                      AutoScrollService.instance?.setProfile(i)
+                      val nome = if (i == 0) "A" else "B"
+                      Toast.makeText(this, "Perfil " + nome + " ativo", Toast.LENGTH_SHORT).show()
+                  }
+
+                  fun startWith(i: Int) {
+                      val s = needService()
+                      if (s != null) {
+                          applyAll()
+                          AutoScrollService.activeProfile = i
+                          s.setProfile(i)
+                          s.start()
+                          val nome = if (i == 0) "A" else "B"
+                          Toast.makeText(this, "Iniciado no perfil " + nome + ". Abra o Kwai.", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+
+                  root.addView(button("Usar perfil A") { choose(0) })
+                  root.addView(button("Usar perfil B") { choose(1) })
 
                   root.addView(label("\n3) Botões flutuantes (START / STOP sobre o Kwai)"))
                   root.addView(button("Mostrar botões flutuantes") {
                       val s = needService()
                       if (s != null) {
-                          applyTimes()
+                          applyAll()
                           s.showOverlay()
                           Toast.makeText(this, "Abra o Kwai e use START / STOP", Toast.LENGTH_SHORT).show()
                       }
@@ -463,11 +646,13 @@ jobs:
                   root.addView(button("Iniciar") {
                       val s = needService()
                       if (s != null) {
-                          applyTimes()
+                          applyAll()
                           s.start()
                           Toast.makeText(this, "Iniciado. Abra o Kwai.", Toast.LENGTH_SHORT).show()
                       }
                   })
+                  root.addView(button("Iniciar no perfil A") { startWith(0) })
+                  root.addView(button("Iniciar no perfil B") { startWith(1) })
                   root.addView(button("Parar") {
                       AutoScrollService.instance?.stop()
                       Toast.makeText(this, "Parado", Toast.LENGTH_SHORT).show()
@@ -505,3 +690,4 @@ jobs:
         with:
           name: kwai-auto-scroll-apk
           path: project/app/build/outputs/apk/debug/app-debug.apk
+          
